@@ -1,6 +1,6 @@
-use proc_macro::TokenStream;
+use proc_macro::{Span, TokenStream};
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, Ident};
+use syn::{parse_macro_input, AngleBracketedGenericArguments, DeriveInput, Ident, Type, TypePath};
 
 #[proc_macro_derive(Builder)]
 pub fn derive(input: TokenStream) -> TokenStream {
@@ -9,56 +9,92 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let ident = input.ident;
     let builder_ident = Ident::new(&format!("{}Builder", ident), ident.span());
     let syn::Data::Struct(s) = input.data else { unimplemented!() };
-    let field_idents = s.fields.iter().map(|f| &f.ident);
-    let field_types = s.fields.iter().map(|f| &f.ty);
+    let (optional_fields, non_optional_fields) =
+        s.fields.iter().partition::<Vec<_>, _>(|f| match &f.ty {
+            Type::Path(TypePath { path, .. }) => {
+                let ident = &path.segments.first().unwrap().ident;
+                *ident == Ident::new("Option", Span::call_site().into())
+            }
+            _ => false,
+        });
+    let _non_opt_idents = non_optional_fields.iter().map(|f| &f.ident);
+    let _non_opt_types = non_optional_fields.iter().map(|f| &f.ty);
+    let _opt_idents = optional_fields.iter().map(|f| &f.ident);
+    let _opt_inner_types = optional_fields.iter().map(|f| {
+        let path = match &f.ty {
+            Type::Path(TypePath { path, .. }) => path,
+            _ => unreachable!(),
+        };
+        let args = &path.segments.first().unwrap().arguments;
+        match args {
+            syn::PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }) => {
+                args.first().unwrap()
+            }
+            syn::PathArguments::None => todo!(),
+            syn::PathArguments::Parenthesized(_) => todo!(),
+        }
+    });
 
-    let f_idents = field_idents.clone();
-    let f_types = field_types.clone();
+    let opt_idents = _opt_idents.clone();
+    let opt_inner_types = _opt_inner_types.clone();
+    let idents = _non_opt_idents.clone();
+    let types = _non_opt_types.clone();
 
     let builder_definition = quote! {
         #[derive(Clone)]
         pub struct #builder_ident {
-            #(#f_idents: Option<#f_types>,)*
+            #(#opt_idents: Option<#opt_inner_types>,)*
+            #(#idents: Option<#types>,)*
         }
     };
 
-    let f_idents = field_idents.clone();
-    let f_types = field_types.clone();
-    let builder_impl = quote! {
+    let opt_idents = _opt_idents.clone();
+    let opt_inner_types = _opt_inner_types.clone();
+    let idents = _non_opt_idents.clone();
+    let types = _non_opt_types.clone();
+
+    let builder_setter = quote! {
         impl #builder_ident {
             #(
-            fn #f_idents(&mut self, #f_idents: #f_types) -> &mut Self {
-                self.#f_idents = Some(#f_idents);
+            fn #idents(&mut self, #idents: #types) -> &mut Self {
+                self.#idents = Some(#idents);
+                self
+            }
+            )*
+            #(
+            fn #opt_idents(&mut self, #opt_idents: #opt_inner_types) -> &mut Self {
+                self.#opt_idents = Some(#opt_idents);
                 self
             }
             )*
         }
     };
 
-    let f_idents = field_idents.clone();
     let builder_build = quote! {
         impl #builder_ident {
             pub fn build(&mut self) -> Result<#ident, Box<dyn std::error::Error>> {
                 let builder = self.clone();
                 Ok(#ident {
-                    #(#f_idents : builder.#f_idents.ok_or_else(|| concat!("field `", stringify!(#f_idents), "` is missing."))?,)*
+                    #(#_non_opt_idents : builder.#_non_opt_idents.ok_or_else(|| concat!("field `", stringify!(#_non_opt_idents), "` is missing."))?,)*
+                    #(#_opt_idents: builder.#_opt_idents,)*
                 })
             }
         }
     };
 
+    let idents = s.fields.iter().map(|f| &f.ident);
     let output = quote! {
         impl #ident {
             pub fn builder() -> #builder_ident {
                 #builder_ident {
-                    #(#field_idents: None,)*
+                    #(#idents: None,)*
                 }
             }
         }
 
         #builder_definition
 
-        #builder_impl
+        #builder_setter
 
         #builder_build
     };
