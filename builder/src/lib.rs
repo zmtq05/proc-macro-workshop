@@ -16,6 +16,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let f_types = field_types.clone();
 
     let builder_definition = quote! {
+        #[derive(Clone)]
         pub struct #builder_ident {
             #(#f_idents: Option<#f_types>,)*
         }
@@ -34,6 +35,18 @@ pub fn derive(input: TokenStream) -> TokenStream {
         }
     };
 
+    let f_idents = field_idents.clone();
+    let builder_build = quote! {
+        impl #builder_ident {
+            pub fn build(&mut self) -> Result<#ident, Box<dyn std::error::Error>> {
+                let builder = self.clone();
+                Ok(#ident {
+                    #(#f_idents : builder.#f_idents.ok_or_else(|| concat!("field `", stringify!(#f_idents), "` is missing."))?,)*
+                })
+            }
+        }
+    };
+
     let output = quote! {
         impl #ident {
             pub fn builder() -> #builder_ident {
@@ -46,6 +59,8 @@ pub fn derive(input: TokenStream) -> TokenStream {
         #builder_definition
 
         #builder_impl
+
+        #builder_build
     };
 
     output.into()
