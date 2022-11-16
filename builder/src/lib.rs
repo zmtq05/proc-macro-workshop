@@ -63,99 +63,83 @@ pub fn derive(input: TokenStream) -> TokenStream {
         let setters = fields.iter().map(|f| {
             let ident = f.ident.as_ref().unwrap();
             let ty = &f.ty;
-            let repeated = f
+            // 1. get attributes
+            // 2. if exists and path is builder
+            //   - key is valid
+            //      - value is equal to field name => generate one-at-a-time method
+            //      - not equal => generate one-at-a-time method and all-at-once method
+            //   - key isn't valid
+            //      => compile error
+            // 3. not exists
+            //   => generate all-at-once method
+            let meta_list = f
                 .attrs
                 .iter()
-                // #[builder ...]
                 .filter(|attr| attr.path.is_ident("builder"))
-                .map(|attr| {
-                    // #[builder(each = "arg")]
-                    //   ^^^^^^^^^^^^^^^^^^^^^
-                    match attr.parse_meta().unwrap() {
-                        Meta::List(list) => list.nested.first().map(|nested_meta| match nested_meta {
-                            NestedMeta::Meta(meta) => match meta {
-                                // #[builder(each = "arg")]
-                                //           ^^^^^^^^^^^^
-                                Meta::NameValue(MetaNameValue { path, lit, .. }) => {
-                                    if *path.get_ident().unwrap() != "each" {
-                                        return Err(Error::new(
-                                            list.span(),
-                                            "expected `builder(each = \"...\")`",
-                                        ));
-                                    }
-                                    if name_of_type(ty).as_str() != "Vec" {
-                                        unimplemented!()
-                                    }
-                                    let lit = match lit {
-                                        Lit::Str(litstr) => litstr,
-                                        _ => unreachable!(),
-                                    };
-                                    let str = lit.value();
-                                    let repeat = Ident::new(&str, lit.span());
-                                    let ty = generic_inner_type(ty);
-                                    Ok((
-                                        str,
-                                        quote! {
-                                            fn #repeat(&mut self, #repeat: #ty) -> &mut Self {
-                                                self.#ident.get_or_insert_with(std::vec::Vec::new).push(#repeat);
-                                                self
-                                            }
-                                        },
-                                    ))
-                                }
-                                Meta::Path(_) | Meta::List(_) => todo!(),
-                            },
-                            NestedMeta::Lit(_) => todo!(),
-                        }),
-                        _ => todo!(),
-                }
+                .map(|attr| match attr.parse_meta().unwrap() {
+                    Meta::List(meta_list) => meta_list,
+                    _ => unimplemented!(),
                 })
-                .next()
-                .flatten();
+                // currently check first attribute only
+                .next();
 
-            match name_of_type(ty).as_str() {
-                "Vec" => match repeated {
-                    Some(Ok((str, token))) => {
-                        if *ident == str {
-                            token
-                        } else {
-                            let set = setter(ident, ty);
-                            quote! {
-                                #token
-
-                                #set
+            match meta_list {
+                // currently check first meta only
+                Some(list) => match &list.nested[0] {
+                    NestedMeta::Meta(Meta::NameValue(MetaNameValue { path, lit, .. })) => {
+                        if !path.is_ident("each") {
+                            return Error::new(list.span(), "expected `builder(each = \"...\")`")
+                                .into_compile_error();
+                        }
+                        let Lit::Str(lit) = lit else { unimplemented!() };
+                        let repeat = Ident::new(&lit.value(), lit.span());
+                        let inner_ty = generic_inner_type(ty);
+                        let output = quote! {
+                            fn #repeat(&mut self, #repeat: #inner_ty) -> &mut Self {
+                                self.#ident.get_or_insert_with(std::vec::Vec::new).push(#repeat);
+                                self
                             }
+                        };
+                        if *ident != lit.value() {
+                            let setter = setter(ident, ty);
+                            quote! {
+                                #output
+                                #setter
+                            }
+                        } else {
+                            output
                         }
                     }
-                    Some(Err(e)) => e.into_compile_error(),
-                    None => setter(ident, ty),
+                    _ => unimplemented!(),
                 },
-                "Option" => setter(ident, generic_inner_type(ty)),
-                _ => setter(ident, ty),
+                None => match name_of_type(ty).as_str() {
+                    "Option" => setter(ident, generic_inner_type(ty)),
+                    _ => setter(ident, ty),
+                },
             }
         });
 
         let build = {
-            let (opt, req) = fields
+            let (opt, non_opt) = fields
                 .iter()
                 .partition::<Vec<_>, _>(|f| name_of_type(&f.ty).as_str() == "Option");
-            let (vec, req) = req.into_iter().partition::<Vec<_>, _>(|f| {
+            let (vec, remain) = non_opt.into_iter().partition::<Vec<_>, _>(|f| {
                 f.attrs.iter().any(|attr| attr.path.is_ident("builder"))
             });
             let opt = opt.into_iter().map(|f| &f.ident);
-            let req = req.into_iter().map(|f| &f.ident);
+            let remains = remain.into_iter().map(|f| &f.ident);
             let repeated = vec.into_iter().map(|f| &f.ident);
             quote! {
                 pub fn build(&mut self) -> std::result::Result<#origin_ident, std::boxed::Box<dyn std::error::Error>> {
                     std::result::Result::Ok(#origin_ident {
-                        // non-optional fields
-                        #(#req: self.#req.take().ok_or_else(|| concat!("field `", stringify!(#req), "` is missing."))?,)*
-
                         // optional fields
                         #(#opt: self.#opt.take(),)*
 
                         // repeated fields
-                        #(#repeated: self.#repeated.take().unwrap_or_else(Vec::new),)*
+                        #(#repeated: self.#repeated.take().unwrap_or_else(std::vec::Vec::new),)*
+
+                        // remaining fields
+                        #(#remains: self.#remains.take().ok_or_else(|| concat!("field `", stringify!(#remains), "` is missing."))?,)*
                     })
                 }
             }
