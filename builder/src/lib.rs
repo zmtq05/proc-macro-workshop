@@ -1,128 +1,173 @@
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote, ToTokens};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArguments, DeriveInput, Ident,
-    Lit, Meta, MetaList, MetaNameValue, NestedMeta, Path, PathArguments, Type, TypePath,
+    parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArguments, Data, DataStruct,
+    DeriveInput, Fields, FieldsNamed, Ident, Lit, Meta, MetaNameValue, NestedMeta, Path,
+    PathArguments, Type, TypePath,
 };
 
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let input: DeriveInput = parse_macro_input!(input);
 
-    let ident = input.ident;
-    let builder_ident = Ident::new(&format!("{}Builder", ident), ident.span());
+    let origin_ident = input.ident;
+    let builder_ident = format_ident!("{origin_ident}Builder");
 
-    let syn::Data::Struct(struct_data) = input.data else { unimplemented!() };
+    let fields = match input.data {
+        Data::Struct(DataStruct {
+            fields: Fields::Named(FieldsNamed { named, .. }),
+            ..
+        }) => named,
+        _ => unimplemented!(),
+    };
 
-    let builder_constructor_impl = quote! {
-        impl #ident {
-            pub fn builder() -> #builder_ident {
-                #builder_ident::default()
+    let definition = {
+        let fields = fields.iter().map(|f| {
+            let ident = &f.ident;
+            let ty = &f.ty;
+            match name_of_type(ty).as_str() {
+                "Option" => quote! { #ident: #ty },
+                _ => quote! { #ident: Option<#ty> },
+            }
+        });
+        quote! {
+            pub struct #builder_ident {
+                #(#fields,)*
             }
         }
     };
 
-    let builder_fields = struct_data.fields.iter().map(|f| {
-        let ident = &f.ident;
-        let ty = &f.ty;
-        match name_of_type(ty).as_str() {
-            "Option" | "Vec" => quote! { #ident: #ty },
-            _ => quote! { #ident: Option<#ty> },
-        }
-    });
-
-    let builder_definition = quote! {
-        #[derive(Clone, Default)]
-        pub struct #builder_ident {
-            #(#builder_fields,)*
+    let constructor = {
+        let idents = fields.iter().map(|f| &f.ident);
+        quote! {
+            impl #origin_ident {
+                pub fn builder() -> #builder_ident {
+                    #builder_ident {
+                        #(#idents: None,)*
+                    }
+                }
+            }
         }
     };
 
-    let setters = struct_data.fields.iter().map(|f| {
-        let ident = f.ident.as_ref().unwrap();
-        let ty = &f.ty;
-        match name_of_type(ty).as_str() {
-            "Option" => {
-                let ty = generic_inner_type(ty).unwrap();
-                quote! {
-                    fn #ident(&mut self, #ident: #ty) -> &mut Self {
-                        self.#ident = Some(#ident);
-                        self
-                    }
-                }
-            }
-            "Vec" => {
-                let Some(attr) = f.attrs.first() else {
-                    return quote! {
-                        fn #ident(&mut self, #ident: #ty) -> &mut Self {
-                            self.#ident = #ident;
-                            self
-                        }
-                    }
-                };
-                let meta = attr.parse_meta().unwrap();
-                let Meta::List(MetaList { nested, .. }) = meta else { unimplemented!("meta") };
-                match nested.first().unwrap() {
-                    NestedMeta::Meta(Meta::NameValue(MetaNameValue { lit, .. })) => {
-                        let Lit::Str(litstr) = lit else { unimplemented!() };
-                        let lit = &litstr.value();
-                        if lit == &ident.to_string() {
-                            return quote! {};
-                        }
-                        let lit = Ident::new(lit, litstr.span());
-                        let ty = generic_inner_type(ty);
-                        quote! {
-                            fn #lit(&mut self, a: #ty) -> &mut Self {
-                                self.#ident.push(a);
-                                self
-                            }
-                        }
-                    }
-                    _ => unimplemented!(),
-                }
-            }
-            _ => quote! {
+    let implmentation = {
+        fn setter(ident: impl ToTokens, ty: impl ToTokens) -> proc_macro2::TokenStream {
+            quote! {
                 fn #ident(&mut self, #ident: #ty) -> &mut Self {
                     self.#ident = Some(#ident);
                     self
                 }
-            },
+            }
         }
-    });
 
-    let req_idents = struct_data
-        .fields
-        .iter()
-        .filter(|f| !matches!(name_of_type(&f.ty).as_str(), "Option" | "Vec"))
-        .map(|f| &f.ident);
-    let opt_idents = struct_data
-        .fields
-        .iter()
-        .filter(|f| matches!(name_of_type(&f.ty).as_str(), "Option" | "Vec"))
-        .map(|f| &f.ident);
-    let build_fn = quote! {
-        pub fn build(&mut self) -> Result<#ident, Box<dyn std::error::Error>> {
-            let builder = self.clone();
-            Ok(#ident {
-                #(#req_idents: builder.#req_idents.ok_or_else(|| concat!("field `", stringify!(#req_idents), "` is missing."))?,)*
-                #(#opt_idents: builder.#opt_idents,)*
-            })
+        let setters = fields.iter().map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let ty = &f.ty;
+            let repeated = f
+                .attrs
+                .iter()
+                // #[builder ...]
+                .filter(|attr| attr.path.is_ident("builder"))
+                .map(|attr| match attr.parse_meta().unwrap() {
+                    // #[builder(each = "arg")]
+                    //   ^^^^^^^^^^^^^^^^^^^^^
+                    Meta::List(list) => list.nested.first().map(|nested_meta| match nested_meta {
+                        NestedMeta::Meta(meta) => match meta {
+                            // #[builder(each = "arg")]
+                            //           ^^^^^^^^^^^^
+                            Meta::NameValue(MetaNameValue { lit, .. }) => {
+                                if name_of_type(ty).as_str() != "Vec" {
+                                    unimplemented!()
+                                }
+                                let lit = match lit {
+                                    Lit::Str(litstr) => litstr,
+                                    _ => unreachable!(),
+                                };
+                                let str = lit.value();
+                                let repeat = Ident::new(&str, lit.span());
+                                let ty = generic_inner_type(ty);
+                                (
+                                    str,
+                                    quote! {
+                                        fn #repeat(&mut self, #repeat: #ty) -> &mut Self {
+                                            self.#ident.get_or_insert_with(Vec::new).push(#repeat);
+                                            self
+                                        }
+                                    },
+                                )
+                            }
+                            Meta::Path(_) | Meta::List(_) => todo!(),
+                        },
+                        NestedMeta::Lit(_) => todo!(),
+                    }),
+                    _ => todo!(),
+                })
+                .next()
+                .flatten();
+
+            match name_of_type(ty).as_str() {
+                "Vec" => match repeated {
+                    Some((str, token)) => {
+                        if *ident == str {
+                            token
+                        } else {
+                            let set = setter(ident, ty);
+                            quote! {
+                                #token
+
+                                #set
+                            }
+                        }
+                    }
+                    None => setter(ident, ty),
+                },
+                "Option" => setter(ident, generic_inner_type(ty)),
+                _ => setter(ident, ty),
+            }
+        });
+
+        let build = {
+            let (opt, req) = fields
+                .iter()
+                .partition::<Vec<_>, _>(|f| name_of_type(&f.ty).as_str() == "Option");
+            let (vec, req) = req.into_iter().partition::<Vec<_>, _>(|f| {
+                f.attrs.iter().any(|attr| attr.path.is_ident("builder"))
+            });
+            let opt = opt.into_iter().map(|f| &f.ident);
+            let req = req.into_iter().map(|f| &f.ident);
+            let repeated = vec.into_iter().map(|f| &f.ident);
+            quote! {
+                pub fn build(&mut self) -> Result<#origin_ident, Box<dyn std::error::Error>> {
+                    Ok(#origin_ident {
+                        // non-optional fields
+                        #(#req: self.#req.take().ok_or_else(|| concat!("field `", stringify!(#req), "` is missing."))?,)*
+
+                        // optional fields
+                        #(#opt: self.#opt.take(),)*
+
+                        // repeated fields
+                        #(#repeated: self.#repeated.take().unwrap_or_else(Vec::new),)*
+                    })
+                }
+            }
+        };
+        quote! {
+            impl #builder_ident {
+                #(#setters)*
+
+                #build
+            }
         }
     };
 
-    let output = quote! {
-        #builder_constructor_impl
+    quote! {
+        #constructor
 
-        #builder_definition
+        #definition
 
-        impl #builder_ident {
-            #(#setters)*
-
-            #build_fn
-        }
-    };
-
-    output.into()
+        #implmentation
+    }
+    .into()
 }
 
 fn get_path(ty: &Type) -> Option<&Path> {
@@ -132,9 +177,9 @@ fn get_path(ty: &Type) -> Option<&Path> {
     }
 }
 
-fn generic_inner_type(ty: &Type) -> Option<&Punctuated<syn::GenericArgument, syn::token::Comma>> {
-    match &get_path(ty)?.segments[0].arguments {
-        PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }) => Some(args),
+fn generic_inner_type(ty: &Type) -> &Punctuated<syn::GenericArgument, syn::token::Comma> {
+    match &get_path(ty).unwrap().segments[0].arguments {
+        PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }) => args,
         _ => unimplemented!(),
     }
 }
