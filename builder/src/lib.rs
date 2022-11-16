@@ -1,9 +1,9 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote, ToTokens};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArguments, Data, DataStruct,
-    DeriveInput, Fields, FieldsNamed, Ident, Lit, Meta, MetaNameValue, NestedMeta, Path,
-    PathArguments, Type, TypePath,
+    parse_macro_input, punctuated::Punctuated, spanned::Spanned, AngleBracketedGenericArguments,
+    Data, DataStruct, DeriveInput, Error, Fields, FieldsNamed, Ident, Lit, Meta, MetaNameValue,
+    NestedMeta, Path, PathArguments, Type, TypePath,
 };
 
 #[proc_macro_derive(Builder, attributes(builder))]
@@ -68,46 +68,54 @@ pub fn derive(input: TokenStream) -> TokenStream {
                 .iter()
                 // #[builder ...]
                 .filter(|attr| attr.path.is_ident("builder"))
-                .map(|attr| match attr.parse_meta().unwrap() {
+                .map(|attr| {
                     // #[builder(each = "arg")]
                     //   ^^^^^^^^^^^^^^^^^^^^^
-                    Meta::List(list) => list.nested.first().map(|nested_meta| match nested_meta {
-                        NestedMeta::Meta(meta) => match meta {
-                            // #[builder(each = "arg")]
-                            //           ^^^^^^^^^^^^
-                            Meta::NameValue(MetaNameValue { lit, .. }) => {
-                                if name_of_type(ty).as_str() != "Vec" {
-                                    unimplemented!()
+                    match attr.parse_meta().unwrap() {
+                        Meta::List(list) => list.nested.first().map(|nested_meta| match nested_meta {
+                            NestedMeta::Meta(meta) => match meta {
+                                // #[builder(each = "arg")]
+                                //           ^^^^^^^^^^^^
+                                Meta::NameValue(MetaNameValue { path, lit, .. }) => {
+                                    if *path.get_ident().unwrap() != "each" {
+                                        return Err(Error::new(
+                                            list.span(),
+                                            "expected `builder(each = \"...\")`",
+                                        ));
+                                    }
+                                    if name_of_type(ty).as_str() != "Vec" {
+                                        unimplemented!()
+                                    }
+                                    let lit = match lit {
+                                        Lit::Str(litstr) => litstr,
+                                        _ => unreachable!(),
+                                    };
+                                    let str = lit.value();
+                                    let repeat = Ident::new(&str, lit.span());
+                                    let ty = generic_inner_type(ty);
+                                    Ok((
+                                        str,
+                                        quote! {
+                                            fn #repeat(&mut self, #repeat: #ty) -> &mut Self {
+                                                self.#ident.get_or_insert_with(Vec::new).push(#repeat);
+                                                self
+                                            }
+                                        },
+                                    ))
                                 }
-                                let lit = match lit {
-                                    Lit::Str(litstr) => litstr,
-                                    _ => unreachable!(),
-                                };
-                                let str = lit.value();
-                                let repeat = Ident::new(&str, lit.span());
-                                let ty = generic_inner_type(ty);
-                                (
-                                    str,
-                                    quote! {
-                                        fn #repeat(&mut self, #repeat: #ty) -> &mut Self {
-                                            self.#ident.get_or_insert_with(Vec::new).push(#repeat);
-                                            self
-                                        }
-                                    },
-                                )
-                            }
-                            Meta::Path(_) | Meta::List(_) => todo!(),
-                        },
-                        NestedMeta::Lit(_) => todo!(),
-                    }),
-                    _ => todo!(),
+                                Meta::Path(_) | Meta::List(_) => todo!(),
+                            },
+                            NestedMeta::Lit(_) => todo!(),
+                        }),
+                        _ => todo!(),
+                }
                 })
                 .next()
                 .flatten();
 
             match name_of_type(ty).as_str() {
                 "Vec" => match repeated {
-                    Some((str, token)) => {
+                    Some(Ok((str, token))) => {
                         if *ident == str {
                             token
                         } else {
@@ -119,6 +127,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
                             }
                         }
                     }
+                    Some(Err(e)) => e.into_compile_error(),
                     None => setter(ident, ty),
                 },
                 "Option" => setter(ident, generic_inner_type(ty)),
