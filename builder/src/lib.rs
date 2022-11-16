@@ -27,7 +27,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
             let ty = &f.ty;
             match name_of_type(ty).as_str() {
                 "Option" => quote! { #ident: #ty },
-                _ => quote! { #ident: Option<#ty> },
+                _ => quote! { #ident: std::option::Option<#ty> },
             }
         });
         quote! {
@@ -43,7 +43,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
             impl #origin_ident {
                 pub fn builder() -> #builder_ident {
                     #builder_ident {
-                        #(#idents: None,)*
+                        #(#idents: std::option::Option::None,)*
                     }
                 }
             }
@@ -54,7 +54,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
         fn setter(ident: impl ToTokens, ty: impl ToTokens) -> proc_macro2::TokenStream {
             quote! {
                 fn #ident(&mut self, #ident: #ty) -> &mut Self {
-                    self.#ident = Some(#ident);
+                    self.#ident = std::option::Option::Some(#ident);
                     self
                 }
             }
@@ -97,7 +97,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
                                         str,
                                         quote! {
                                             fn #repeat(&mut self, #repeat: #ty) -> &mut Self {
-                                                self.#ident.get_or_insert_with(Vec::new).push(#repeat);
+                                                self.#ident.get_or_insert_with(std::vec::Vec::new).push(#repeat);
                                                 self
                                             }
                                         },
@@ -146,8 +146,8 @@ pub fn derive(input: TokenStream) -> TokenStream {
             let req = req.into_iter().map(|f| &f.ident);
             let repeated = vec.into_iter().map(|f| &f.ident);
             quote! {
-                pub fn build(&mut self) -> Result<#origin_ident, Box<dyn std::error::Error>> {
-                    Ok(#origin_ident {
+                pub fn build(&mut self) -> std::result::Result<#origin_ident, std::boxed::Box<dyn std::error::Error>> {
+                    std::result::Result::Ok(#origin_ident {
                         // non-optional fields
                         #(#req: self.#req.take().ok_or_else(|| concat!("field `", stringify!(#req), "` is missing."))?,)*
 
